@@ -55,8 +55,15 @@ def type_allows(node: SchemaNode, value_type: str, value: Any = None) -> bool:
 
 
 def validate(node: SchemaNode, value: Any, path: str = "",
-             depth: int = 0) -> list[str]:
-    """Return a list of validation error messages (empty => valid)."""
+             depth: int = 0, skip_undecidable: bool = False) -> list[str]:
+    """Return a list of validation error messages (empty => valid).
+
+    With ``skip_undecidable=True`` only *known* (decidable) constraint
+    failures are reported: nodes whose constraints cannot be decided at all
+    (reference cycles, invalid / unresolvable schemas) are treated as
+    transparent instead of producing an error, so callers can adjudicate
+    them separately via :func:`unsupported_along_value`.
+    """
     errors: list[str] = []
     if node.is_bool is True:
         return errors
@@ -65,6 +72,8 @@ def validate(node: SchemaNode, value: Any, path: str = "",
     if node.is_cycle:
         return errors  # cannot judge => optimistically accept
     if node.invalid:
+        if skip_undecidable:
+            return errors  # undecidable node: reported along the value
         return [f"{path or '#'}: 模式不可判定（{node.invalid}）"]
     if node.unsupported:
         # We can still check the facets we know; unsupported keywords are
@@ -123,7 +132,8 @@ def validate(node: SchemaNode, value: Any, path: str = "",
                 errors.append(f"{path or '#'}: 数组元素不唯一")
         for i, item in enumerate(value):
             errors.extend(validate(node.items, item,
-                                   f"{path}/{i}", depth + 1))
+                                   f"{path}/{i}", depth + 1,
+                                   skip_undecidable=skip_undecidable))
 
     if vt == "object":
         if node.min_props is not None and len(value) < node.min_props:
@@ -140,7 +150,8 @@ def validate(node: SchemaNode, value: Any, path: str = "",
                 # request/response filtering at replay time is done by the
                 # caller; raw nodes keep both readOnly/writeOnly facets
                 errors.extend(validate(pnode, value[pname],
-                                       f"{path}/{_esc(pname)}", depth + 1))
+                                       f"{path}/{_esc(pname)}", depth + 1,
+                                       skip_undecidable=skip_undecidable))
         extra = {k: v for k, v in value.items() if k not in node.properties}
         if node.additional is False and extra:
             errors.append(
@@ -148,7 +159,8 @@ def validate(node: SchemaNode, value: Any, path: str = "",
         elif isinstance(node.additional, SchemaNode) and depth < MAX_DEPTH:
             for k, v in sorted(extra.items()):
                 errors.extend(validate(node.additional, v,
-                                       f"{path}/{_esc(k)}", depth + 1))
+                                       f"{path}/{_esc(k)}", depth + 1,
+                                       skip_undecidable=skip_undecidable))
 
     # 组合分支按三态裁决（确定通过 / 确定失败 / 待定）：oneOf 要求
     # **恰好一个**分支确定通过——两个确定通过即校验失败；anyOf 要求
@@ -191,25 +203,39 @@ _UNSUPPORTED_KW_TYPES = {
 
 def unsupported_along_value(node: SchemaNode, value: Any,
                             depth: int = 0) -> list:
-    """Unsupported keywords whose skipped constraints decide ``value``'s fate.
+    """Pending factors whose skipped constraints decide ``value``'s fate.
 
     Walks the parsed schema graph *along the actual value* — local ``$ref``
     (already resolved into the graph), nested properties, array items and
     ``oneOf``/``anyOf`` branches — and returns ``(keyword, FacetLoc)`` for
-    every unsupported keyword the value's verdict still depends on. Optional
-    properties absent from the value are not visited, and keywords that do
-    not apply to the value's JSON type (e.g. ``pattern`` for an integer) are
-    ignored. Compositions are adjudicated per branch state
+    every factor the value's verdict still depends on:
+
+    * unsupported *keywords* (``pattern``, ``not``, ``contains`` …); and
+    * *undecidable nodes* reached by the value — reference cycles and
+      invalid / unresolvable schemas — reported as ``循环引用`` /
+      ``模式不可判定`` with the schema location.
+
+    Optional properties absent from the value are not visited (an untouched
+    optional cyclic property therefore stays coverable), and keywords that
+    do not apply to the value's JSON type (e.g. ``pattern`` for an integer)
+    are ignored. Compositions are adjudicated per branch state
     （确定通过 / 确定失败 / 待定）: for ``oneOf`` a single cleanly passing
     branch only settles the verdict when every other branch definitely
-    fails — a sibling that may still pass (``pattern`` …) keeps the row
-    undetermined; for ``anyOf`` one cleanly passing branch is enough.
+    fails — a sibling that may still pass (``pattern``, a reached cycle …)
+    keeps the row undetermined; for ``anyOf`` one cleanly passing branch is
+    enough.
     """
     hits: list = []
     if node is None or depth >= MAX_DEPTH:
         return hits
-    if node.is_bool is not None or node.is_cycle or node.invalid:
-        return hits  # bool/cycle/invalid nodes are reported by the caller
+    if node.is_cycle:
+        hits.append(("循环引用", node.loc))
+        return hits
+    if node.invalid:
+        hits.append((f"模式不可判定: {node.invalid}", node.loc))
+        return hits
+    if node.is_bool is not None:
+        return hits  # bool schemas are decided by validate
 
     vt = _json_type(value)
     for kw, loc in node.unsupported:
@@ -240,7 +266,8 @@ def unsupported_along_value(node: SchemaNode, value: Any,
         if verdicts.count(_BRANCH_PASS) <= 1:
             for branch, verdict in zip(node.one_of, verdicts):
                 if verdict == _BRANCH_UNDECIDED:
-                    hits.extend(_pending_hits(branch, value, depth + 1))
+                    hits.extend(unsupported_along_value(
+                        branch, value, depth + 1))
     # anyOf「至少一个」：已有一个确定通过即覆盖（其余分支待定不影响
     # 结论）；否则整体能否通过取决于待定分支。
     if node.any_of and depth < MAX_DEPTH:
@@ -248,7 +275,8 @@ def unsupported_along_value(node: SchemaNode, value: Any,
         if _BRANCH_PASS not in verdicts:
             for branch, verdict in zip(node.any_of, verdicts):
                 if verdict == _BRANCH_UNDECIDED:
-                    hits.extend(_pending_hits(branch, value, depth + 1))
+                    hits.extend(unsupported_along_value(
+                        branch, value, depth + 1))
     return hits
 
 
@@ -263,70 +291,21 @@ def _branch_verdicts(branches, value, path: str, depth: int) -> list:
     """Classify each combinator branch for ``value`` into the three states.
 
     * 确定失败：已支持（可判定）约束已经失败——未支持或不可判定的约束
-      只会更严格，不可能让分支重新通过；
+      只会更严格，不可能让分支重新通过，因此同一分支内**已知约束失败
+      优先于**触达循环 / 无法解析节点；
     * 待定：已知约束全过，但通过与否仍依赖 ``pattern`` 等未支持关键字，
       或取值触达了循环引用 / 无法解析的节点；
     * 确定通过：已知约束全过且没有任何待定因素。
     """
     verdicts: list = []
     for b in branches:
-        if _undecidable_along_value(b, value, depth + 1):
-            verdicts.append(_BRANCH_UNDECIDED)
-        elif validate(b, value, path, depth + 1):
+        if validate(b, value, path, depth + 1, skip_undecidable=True):
             verdicts.append(_BRANCH_FAIL)
         elif unsupported_along_value(b, value, depth + 1):
             verdicts.append(_BRANCH_UNDECIDED)
         else:
             verdicts.append(_BRANCH_PASS)
     return verdicts
-
-
-def _pending_hits(node: SchemaNode, value: Any, depth: int) -> list:
-    """待定分支需要列出的原因：未支持关键字，以及循环/不可判定节点位置。"""
-    hits = unsupported_along_value(node, value, depth)
-    hits.extend(_undecidable_along_value(node, value, depth))
-    return hits
-
-
-def _undecidable_along_value(node: SchemaNode, value: Any,
-                             depth: int = 0) -> list:
-    """Nodes along ``value`` whose constraints cannot be decided at all.
-
-    :func:`unsupported_along_value` reports unsupported *keywords*; this
-    walk covers the harder undecidable cases — reference cycles and
-    invalid / unresolvable schemas — so that a combinator branch touching
-    them is treated as 待定 instead of being optimistically counted as
-    确定通过. Untouched optional properties are not visited.
-    """
-    hits: list = []
-    if node is None or depth >= MAX_DEPTH:
-        return hits
-    if node.is_cycle:
-        hits.append(("循环引用", node.loc))
-        return hits
-    if node.invalid:
-        hits.append(("模式不可判定", node.loc))
-        return hits
-    if node.is_bool is not None:
-        return hits
-    vt = _json_type(value)
-    if vt == "object":
-        for pname, pnode in node.properties.items():
-            if pname in value:
-                hits.extend(_undecidable_along_value(
-                    pnode, value[pname], depth + 1))
-        if isinstance(node.additional, SchemaNode):
-            for k in sorted(k for k in value if k not in node.properties):
-                hits.extend(_undecidable_along_value(
-                    node.additional, value[k], depth + 1))
-    elif vt == "array" and node.items is not None:
-        for item in value:
-            hits.extend(_undecidable_along_value(node.items, item,
-                                                 depth + 1))
-    for branches in (node.one_of, node.any_of):
-        for b in branches:
-            hits.extend(_undecidable_along_value(b, value, depth + 1))
-    return hits
 
 
 def minimal_instance(node: SchemaNode, depth: int = 0,

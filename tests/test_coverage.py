@@ -623,6 +623,227 @@ def test_unsupported_keyword_not_keyword_any_type(client):
     assert doc["summary"]["cells_covered"] == 0
 
 
+# ============================================================== 循环 / 不可解析节点
+def _recursive_spec():
+    """自引用 Node：child 指回自身。"""
+    return {
+        "openapi": "3.0.3", "info": {"title": "t", "version": "1"},
+        "paths": {"/nodes": {"post": {
+            "requestBody": {"required": True, "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/Node"}}}},
+            "responses": {"200": {"description": "ok", "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/Node"}}}}}}}},
+        "components": {"schemas": {"Node": {
+            "type": "object", "required": ["name"],
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"$ref": "#/components/schemas/Node"}}}}},
+    }
+
+
+def test_cycle_reached_in_request_body_is_undetermined(client):
+    # 调用值的 child 属性触达自引用节点 → 无法判定，不计覆盖格
+    aid = _analysis_from_docs(client, _recursive_spec())
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/nodes",
+         "request": {"media_type": "application/json",
+                     "body": {"name": "a", "child": {"name": "b"}}},
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"name": "a"}}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    # 报告循环及其模式位置
+    assert any("循环引用" in x and "#/components/schemas/Node" in x
+               for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+    op = doc["operations"][0]
+    assert {c["key"] for c in op["gaps"]} == {"200|application/json"}
+    # 保存后的确定性导出给出同一逐行结论与缺口
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["summary"] == doc["summary"]
+    assert exported["operations"] == doc["operations"]
+
+
+def test_cycle_reached_in_response_body_is_undetermined(client):
+    aid = _analysis_from_docs(client, _recursive_spec())
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/nodes",
+         "request": {"media_type": "application/json",
+                     "body": {"name": "a"}},
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"name": "a",
+                               "child": {"name": "b",
+                                         "child": {"name": "c"}}}}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("循环引用" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_untouched_optional_cycle_property_still_covered(client):
+    # 可选循环属性未触达 → 不影响覆盖
+    aid = _analysis_from_docs(client, _recursive_spec())
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/nodes",
+         "request": {"media_type": "application/json",
+                     "body": {"name": "a"}},
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"name": "a"}}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["rows"][0]["reasons"] == []
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_unresolvable_ref_reached_along_value_is_undetermined(client):
+    # 嵌套的外部 $ref（无法解析节点）被取值触达 → 无法判定而非校验失败
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "ext": {"$ref": "https://e.example.com/s#/T"}}}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"a": "x", "ext": {"whatever": 1}}},
+         "response": {"status": 200}},
+        # 未触达 ext → 仍可覆盖
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": {"a": "x"}},
+         "response": {"status": 200}},
+    ]).json()
+    rows = doc["rows"]
+    assert rows[0]["outcome"] == "undetermined"
+    assert any("不可判定" in x and "properties/ext" in x
+               for x in rows[0]["reasons"])
+    assert rows[1]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_mutual_recursion_reached_is_undetermined(client):
+    # A ↔ B 相互引用，取值沿 items / properties 触达循环
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/A"}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    spec["components"] = {"schemas": {
+        "A": {"type": "object", "required": ["n"],
+              "properties": {"n": {"type": "string"},
+                             "bs": {"type": "array", "items": {
+                                 "$ref": "#/components/schemas/B"}}}},
+        "B": {"type": "object",
+              "properties": {"back": {"$ref": "#/components/schemas/A"}}}}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"n": "x", "bs": [{"back": {"n": "y"}}]}},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("循环引用" in x and "#/components/schemas/A" in x
+               for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def _cycle_branch_spec(kind):
+    """组合分支：一分支干净，另一分支带自引用属性 next。"""
+    schema = {kind: [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}, "v": {"type": "string"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string"},
+                        "next": {"$ref": "#/components/schemas/N"}}},
+    ]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    spec["components"] = {"schemas": {"N": {
+        "type": "object",
+        "properties": {"next": {"$ref": "#/components/schemas/N"}}}}}
+    return spec
+
+
+def _cycle_touching_call():
+    # 取值触达第二分支里的循环节点（next.next）
+    return {"method": "POST", "path": "/p",
+            "request": {"media_type": "application/json",
+                        "body": {"kind": "a", "v": "x",
+                                 "next": {"next": {}}}},
+            "response": {"status": 200}}
+
+
+def test_oneof_pass_plus_cycle_pending_branch_is_undetermined(client):
+    # oneOf「恰好一个」：一分支确定通过 + 一分支触达循环待定 → 无法判定
+    aid = _analysis_from_docs(client, _cycle_branch_spec("oneOf"))
+    doc = _upload(client, aid, "baseline", [_cycle_touching_call()]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    # 报告循环节点的模式位置（$ref 目标处）
+    assert any("循环引用" in x and "#/components/schemas/N" in x
+               for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+
+
+def test_anyof_pass_plus_cycle_pending_branch_is_covered(client):
+    # anyOf「至少一个」：相同条件下一个确定通过即可覆盖
+    aid = _analysis_from_docs(client, _cycle_branch_spec("anyOf"))
+    doc = _upload(client, aid, "baseline", [_cycle_touching_call()]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_known_failure_beats_cycle_in_same_branch(client):
+    # 同一分支内已知约束失败优先于循环待定：第二分支 v 应为 integer，
+    # 取值是字符串（已知失败），即使同时触达循环也判失败 → oneOf 恰好
+    # 一个确定通过 → 覆盖
+    spec = _cycle_branch_spec("oneOf")
+    spec["paths"]["/p"]["post"]["requestBody"]["content"][
+        "application/json"]["schema"]["oneOf"][1]["properties"]["v"] = \
+        {"type": "integer"}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"kind": "a", "v": "not-an-int",
+                              "next": {"next": {}}}},
+         "response": {"status": 200}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_deep_recursive_value_terminates(client):
+    # 深层嵌套取值沿循环 schema 走查必须在深度预算内终止
+    aid = _analysis_from_docs(client, _recursive_spec())
+    body = {"name": "root"}
+    cur = body
+    for i in range(30):
+        cur["child"] = {"name": f"n{i}"}
+        cur = cur["child"]
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/nodes",
+         "request": {"media_type": "application/json", "body": body},
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"name": "a"}}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert any("循环引用" in x for x in doc["rows"][0]["reasons"])
+
+
 # ============================================================== HTTP surface
 def test_coverage_404_unknown_analysis(client):
     r = _upload(client, "nope", "baseline", [

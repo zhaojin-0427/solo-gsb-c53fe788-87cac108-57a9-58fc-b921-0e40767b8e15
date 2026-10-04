@@ -11,11 +11,13 @@
   才覆盖该格；校验失败、无法判定、未匹配/未归属均逐行给出原因。
 * 已知约束全部通过后，还会**沿调用实际取值遍历解析后的 schema 图**（本地
   ``$ref``、嵌套属性、数组元素、``oneOf``/``anyOf`` 分支）：只要该行能否通过
-  仍依赖 ``pattern`` 等未支持关键字，就列出关键字与位置并记为**无法判定**
-  （不计覆盖）；未触达的可选属性不影响判定。组合分支按三态裁决
-  （确定通过 / 确定失败 / 待定）：``oneOf`` 要求恰好一个——一个分支确定通过
-  而另一分支仍可能通过时记无法判定，两个确定通过记校验失败；``anyOf``
-  要求至少一个——一个分支确定通过即可覆盖。
+  仍依赖 ``pattern`` 等未支持关键字，或取值触达了**循环引用 / 无法解析的
+  节点**（报告其模式位置），就列出原因并记为**无法判定**（不计覆盖）；
+  未触达的可选属性（含可选循环属性）不影响判定。组合分支按三态裁决
+  （确定通过 / 确定失败 / 待定）：同一分支内**已知约束失败优先判失败**，
+  否则触达循环 / 不可解析节点记为待定；``oneOf`` 要求恰好一个——一个分支
+  确定通过而另一分支仍可能通过时记无法判定，两个确定通过记校验失败；
+  ``anyOf`` 要求至少一个——一个分支确定通过即可覆盖。
 
 结果是确定性的：operation / cell 按固定顺序排列，每个格只记录最早一行覆盖调用，
 相同输入永远产生相同文档。
@@ -513,34 +515,37 @@ def _check_value(label: str, node, value: Any,
             f"{label}的约束无法判定（{node.invalid or '循环引用'}）")
         return
     effective = value
-    errors = validate(node, value)
+    errors = validate(node, value, skip_undecidable=True)
     if errors:
         coerced, ok = _coerce_scalar(value, node)
-        if ok and not validate(node, coerced):
+        if ok and not validate(node, coerced, skip_undecidable=True):
             errors = []
             effective = coerced
     if errors:
         failures.append(f"{label}不满足契约约束: {'; '.join(errors[:2])}")
         return
-    # 已知约束全部通过；若通过与否仍依赖被跳过的未支持约束 → 无法判定
+    # 已知约束全部通过；若通过与否仍依赖被跳过的未支持约束，或取值触达了
+    # 循环引用 / 无法解析的节点 → 无法判定
     hits = unsupported_along_value(node, effective)
     if hits:
         undetermined.append(
-            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
+            f"{label}能否通过依赖未支持或不可判定的约束: "
+            f"{_format_hits(hits, entry)}")
 
 
 def _check_body(label: str, node, value: Any,
                 failures: list[str], undetermined: list[str],
                 entry: str) -> None:
-    """请求体 / 响应体的 schema 核对（已知约束 + 值触达的未支持约束）。"""
-    errors = validate(node, value)
+    """请求体 / 响应体的 schema 核对（已知约束 + 值触达的待定因素）。"""
+    errors = validate(node, value, skip_undecidable=True)
     if errors:
         failures.append(f"{label}不满足 schema: " + "; ".join(errors[:3]))
         return
     hits = unsupported_along_value(node, value)
     if hits:
         undetermined.append(
-            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
+            f"{label}能否通过依赖未支持或不可判定的约束: "
+            f"{_format_hits(hits, entry)}")
 
 
 def _is_required(param: dict) -> bool:
