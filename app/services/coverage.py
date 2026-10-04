@@ -9,13 +9,17 @@
   单列一个无实体格；非 JSON 媒体类型不生成覆盖格（按行列明排除原因）；
 * 只有当**请求参数**、**请求体**、**响应体**三侧的可判定约束全部通过时，调用
   才覆盖该格；校验失败、无法判定、未匹配/未归属均逐行给出原因。
-* 已知约束全部通过后，还会**沿调用实际取值遍历解析后的 schema 图**（本地
-  ``$ref``、嵌套属性、数组元素、``oneOf``/``anyOf`` 分支）：只要该行能否通过
-  仍依赖 ``pattern`` 等未支持关键字，就列出关键字与位置并记为**无法判定**
-  （不计覆盖）；未触达的可选属性不影响判定。组合分支按三态裁决
-  （确定通过 / 确定失败 / 待定）：``oneOf`` 要求恰好一个——一个分支确定通过
-  而另一分支仍可能通过时记无法判定，两个确定通过记校验失败；``anyOf``
-  要求至少一个——一个分支确定通过即可覆盖。
+* 已知约束全部通过后，引擎还会**沿调用实际取值遍历解析后的 schema 图**
+  （本地 ``$ref``、嵌套属性、数组元素、``oneOf``/``anyOf`` 组合分支）：
+  取值的 child 触达**自引用 / 相互引用循环**或无法解析的模式节点时，会沿
+  实际值重新展开被引模式继续核对（同一分支的已知失败优先判失败），确实
+  无法定论的记为**无法判定**并报告模式位置；能否通过仍依赖 ``pattern``
+  等未支持关键字时同样列出关键字与位置并记为**无法判定**（不计覆盖）；
+  **未触达的可选属性（含可选循环属性）不会阻断覆盖**，与取值类型无关的
+  关键字（如整数值上的 ``pattern``）也不会误报。组合分支按三态裁决
+  （确定通过 / 确定失败 / 待定）：``oneOf`` 要求恰好一个——一个分支
+  确定通过而另一分支仍可能通过时记无法判定（不计格），两个确定通过记
+  校验失败；``anyOf`` 要求至少一个——一个分支确定通过即可覆盖。
 
 结果是确定性的：operation / cell 按固定顺序排列，每个格只记录最早一行覆盖调用，
 相同输入永远产生相同文档。
@@ -28,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import pointer as ptr
-from .instance import validate, unsupported_along_value
+from .instance import assess, TRI_FAIL, TRI_PENDING
 from .schemagraph import SchemaGraph
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head",
@@ -482,6 +486,18 @@ def _format_hits(hits, entry: str) -> str:
     return "、".join(parts)
 
 
+def _reenter(graph: SchemaGraph):
+    """Rebuild the full schema node at a cycle-marker site so a value that
+    reaches a self-/mutual reference can be checked inside the recursive
+    part (same-branch known failures must still fail)."""
+    def _build(file: str, pointer: str):
+        try:
+            return graph.build_at(file, pointer)
+        except (KeyError, IndexError, ValueError):
+            return None
+    return _build
+
+
 def _coerce_scalar(value: Any, node) -> tuple[Any, bool]:
     """把 HTTP 文本值尝试 coerce 为参数 schema 的标量类型。"""
     if not isinstance(value, str) or node is None or node.type is None:
@@ -503,51 +519,69 @@ def _coerce_scalar(value: Any, node) -> tuple[Any, bool]:
     return value, False
 
 
-def _check_value(label: str, node, value: Any,
+def _assess_value(graph: SchemaGraph, node, value: Any):
+    """Three-state verdict of one parameter/body value along its schema.
+
+    Returns ``(state, errors, hits)`` where ``hits`` are ``(keyword, loc)``
+    pairs for pending unsupported keywords / cycles / invalid nodes.
+    """
+    result = assess(node, value, reenter=_reenter(graph))
+    return result.state, result.errors, result.hits
+
+
+def _check_value(graph: SchemaGraph, label: str, node, value: Any,
                  failures: list[str], undetermined: list[str],
                  entry: str) -> None:
     if node is None:
         return  # 声明了参数但无 schema —— 无取值约束
-    if node.invalid or node.is_cycle:
+    if node.invalid:
         undetermined.append(
-            f"{label}的约束无法判定（{node.invalid or '循环引用'}）")
+            f"{label}的约束无法判定（{node.invalid}）")
+        return
+    if node.is_cycle:
+        undetermined.append(
+            f"{label}的约束无法判定（循环引用）")
         return
     effective = value
-    errors = validate(node, value)
-    if errors:
+    state, errors, hits = _assess_value(graph, node, effective)
+    if state == TRI_FAIL:
         coerced, ok = _coerce_scalar(value, node)
-        if ok and not validate(node, coerced):
-            errors = []
-            effective = coerced
-    if errors:
-        failures.append(f"{label}不满足契约约束: {'; '.join(errors[:2])}")
+        if ok:
+            cstate, cerrors, chits = _assess_value(graph, node, coerced)
+            if cstate != TRI_FAIL:
+                state, errors, hits, effective = \
+                    cstate, cerrors, chits, coerced
+    if state == TRI_FAIL:
+        failures.append(
+            f"{label}不满足契约约束: {'; '.join(errors[:2])}")
         return
-    # 已知约束全部通过；若通过与否仍依赖被跳过的未支持约束 → 无法判定
-    hits = unsupported_along_value(node, effective)
-    if hits:
+    if state == TRI_PENDING:
         undetermined.append(
-            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
+            f"{label}能否通过无法判定: {_format_hits(hits, entry)}")
 
 
-def _check_body(label: str, node, value: Any,
+def _check_body(graph: SchemaGraph, label: str, node, value: Any,
                 failures: list[str], undetermined: list[str],
                 entry: str) -> None:
-    """请求体 / 响应体的 schema 核对（已知约束 + 值触达的未支持约束）。"""
-    errors = validate(node, value)
-    if errors:
+    """请求体 / 响应体的 schema 三态核对。
+
+    根节点自身无法解析/为循环由调用方提前拦截；这里处理取值沿图触达的
+    已知失败（优先）、循环 / 不可解析节点与未支持关键字（待定）。
+    """
+    state, errors, hits = _assess_value(graph, node, value)
+    if state == TRI_FAIL:
         failures.append(f"{label}不满足 schema: " + "; ".join(errors[:3]))
-        return
-    hits = unsupported_along_value(node, value)
-    if hits:
+    elif state == TRI_PENDING:
         undetermined.append(
-            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
+            f"{label}能否通过无法判定: {_format_hits(hits, entry)}")
 
 
 def _is_required(param: dict) -> bool:
     return param.get("in") == "path" or bool(param.get("required"))
 
 
-def _check_parameters(op: _Operation, path_values: dict[str, str],
+def _check_parameters(graph: SchemaGraph, op: _Operation,
+                      path_values: dict[str, str],
                       call: _Call, entry: str) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     undetermined: list[str] = []
@@ -560,7 +594,7 @@ def _check_parameters(op: _Operation, path_values: dict[str, str],
             failures.append(
                 f"路径变量 {name!r} 在操作参数中未声明为 in:path 参数")
             continue
-        _check_value(f"路径参数 {name!r}={raw!r}", node, raw,
+        _check_value(graph, f"路径参数 {name!r}={raw!r}", node, raw,
                      failures, undetermined, entry)
 
     provided_maps = (
@@ -588,8 +622,8 @@ def _check_parameters(op: _Operation, path_values: dict[str, str],
                     failures.append(
                         f"缺少必填{loc_zh[location]}参数 {name!r}")
                 continue
-            _check_value(f"{loc_zh[location]}参数 {name!r}", node, value,
-                         failures, undetermined, entry)
+            _check_value(graph, f"{loc_zh[location]}参数 {name!r}", node,
+                         value, failures, undetermined, entry)
     return failures, undetermined
 
 
@@ -648,7 +682,7 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
 
     # ---- 请求参数
     path_values = _template_match(template, call.path) or {}
-    pf, pu = _check_parameters(op, path_values, call, graph.entry)
+    pf, pu = _check_parameters(graph, op, path_values, call, graph.entry)
     failures.extend(pf)
     undetermined.extend(pu)
 
@@ -689,7 +723,7 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
                             f"请求体 {mt} 的 schema 无法判定"
                             f"（{node.invalid or '循环引用'}）")
                     else:
-                        _check_body(f"请求体 {mt}", node,
+                        _check_body(graph, f"请求体 {mt}", node,
                                     call.request.get("body"),
                                     failures, undetermined, graph.entry)
 
@@ -742,18 +776,19 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
                         f"响应 {code} {mt} 的 schema 无法判定"
                         f"（{node.invalid or '循环引用'}）")
                 else:
-                    _check_body(f"响应 {code} {mt} 载荷", node,
+                    _check_body(graph, f"响应 {code} {mt} 载荷", node,
                                 call.response.get("body"),
                                 failures, undetermined, graph.entry)
 
-    # ---- 汇总：只有可判定约束全部通过才覆盖
+    # ---- 汇总：任一已知约束失败即失败（失败优先）；否则待定阻止覆盖
     if excluded:
         return {**base_row, "outcome": EXCLUDED, "reasons": excluded}
+    if failures:
+        return {**base_row, "outcome": FAILED,
+                "reasons": failures + undetermined}
     if undetermined:
         return {**base_row, "outcome": UNDETERMINED,
-                "reasons": undetermined + failures}
-    if failures:
-        return {**base_row, "outcome": FAILED, "reasons": failures}
+                "reasons": undetermined}
     if cell is None:
         # 声明了 content 但调用实体无法定位到具体格（理论上前面已拦截）
         return {**base_row, "outcome": UNDETERMINED,
@@ -774,7 +809,8 @@ def _find_cell(op: _Operation, status: str, kind: str,
 def _verdict(base_row, failures, undetermined, excluded):
     if excluded:
         return {**base_row, "outcome": EXCLUDED, "reasons": excluded}
-    if undetermined:
-        return {**base_row, "outcome": UNDETERMINED,
-                "reasons": undetermined + failures}
-    return {**base_row, "outcome": FAILED, "reasons": failures}
+    if failures:
+        return {**base_row, "outcome": FAILED,
+                "reasons": failures + undetermined}
+    return {**base_row, "outcome": UNDETERMINED,
+            "reasons": undetermined}

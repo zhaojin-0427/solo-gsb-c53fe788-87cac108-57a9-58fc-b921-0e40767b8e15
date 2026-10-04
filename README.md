@@ -31,8 +31,11 @@ requestBody 被删除（`PARAMETER_MADE_REQUIRED` / `PARAMETER_ADDED_REQUIRED` /
 - 结果可按严重度（破坏性 / 无法判定 / 兼容）筛选，按端点分组或扁平浏览；
 - **调用覆盖视图**：上传 NDJSON 调用记录，按「响应状态码 × JSON 媒体类型」
   生成覆盖格，展示已覆盖格/总格与缺口，未匹配 / 校验失败 / 无法判定逐行列明
-  原因；调用值触达 `pattern` 等未支持关键字时该行记为**无法判定**（列出关键字
-  与位置，不计覆盖）；`oneOf` / `anyOf` 组合分支按「确定通过 / 确定失败 /
+  原因；调用值的 child 触达**自引用 / 相互引用循环**或无法解析的模式节点时，
+  引擎沿实际值重展开被引模式继续核对——同一分支的已知约束失败优先判**失败**，
+  否则记为**无法判定**（列出模式位置，不计格）；触达 `pattern` 等未支持
+  关键字时同样记为**无法判定**（列出关键字与位置，不计覆盖）；未触达的
+  可选循环属性仍可覆盖；`oneOf` / `anyOf` 组合分支按「确定通过 / 确定失败 /
   待定」三态裁决（见下文「调用覆盖」）；结果随分析保存并确定性导出；
 - **确定性 JSON 导出**（键排序、无多余空白），响应头携带 SHA-256 指纹；
 - PostgreSQL 持久化分析记录与原始文档包（用于反例重放）；数据库不可用时
@@ -56,7 +59,10 @@ docker compose up --build
 `docker compose down` 停止；加 `-v` 同时删除数据库卷。
 
 一键启动后，可在页面「比对结果 → **调用覆盖**」标签中选择**基线**或**候选**侧、
-上传 NDJSON 调用记录，查看覆盖矩阵与缺口，或直接用下文的 HTTP API 上传/查询/导出。
+上传 NDJSON 调用记录，查看覆盖矩阵与缺口（含自引用/相互引用循环、无法解析
+节点的「无法判定」行与模式位置），或直接用下文的 HTTP API 上传/查询/导出。
+保存后的覆盖结论同样体现在 `GET /api/analyses/{id}/coverage/{side}` 与
+确定性导出中，页面、API、导出三者逐行一致。
 
 
 ### 上传内容
@@ -134,7 +140,8 @@ pytest -q
 请求/响应头的参数名按 HTTP 惯例**大小写不敏感**匹配，query/cookie 名大小写敏感；
 query/header/cookie/path 的文本值会按参数 schema 尝试标量 coerce（如 `"10"`→整数）。
 
-仓库自带示例 `examples/calls-baseline.ndjson`（覆盖、失败、未匹配、非 JSON 排除各若干行）。
+仓库自带示例 `examples/calls-baseline.ndjson`（覆盖、失败、未匹配、非 JSON
+排除以及取值触达自引用 `parent` 导致的无法判定 / 递归部分已知失败各若干行）。
 
 ### 归属与覆盖规则
 
@@ -148,19 +155,24 @@ query/header/cookie/path 的文本值会按参数 schema 尝试标量 coerce（�
    JSON 媒体指 `application/json` 及 `*/*+json`（如 `application/vnd.api+json`）。
 3. **判定**：仅当**请求参数**（必填存在性 + schema）、**请求体**（required、
    content 媒体类型、body schema）、**响应体**（status 归属、content 与实体一致性、
-   body schema）的**可判定约束全部通过**时才覆盖该格；任一 schema 无法解析/含循环
-   → **无法判定**（不给覆盖）；任一约束失败 → **校验失败**。
+   body schema）的**可判定约束全部通过**时才覆盖该格；取值沿 schema 图触达
+   无法解析节点 → **无法判定**（报告模式位置，不给覆盖）；任一约束失败 →
+   **校验失败**（同一分支的已知失败优先：即使该分支取值同时触达循环或
+   未支持约束，仍判失败）。
    已知约束全部通过后，引擎还会**沿调用实际取值遍历解析后的 schema 图**
-   （本地 `$ref`、嵌套属性、数组元素、`oneOf`/`anyOf` 组合分支）：只要该行
-   能否通过仍依赖 `pattern`、`not`、`contains` 等**未支持关键字**，该行记为
-   **无法判定**并在原因中列出关键字及其位置（跨文件时含文件名），不增加
-   已覆盖格；**未触达的可选属性不会阻断覆盖**，与取值类型无关的关键字
-   （如整数值上的 `pattern`）也不会误报。
+   （本地 `$ref`、嵌套属性、数组元素、`oneOf`/`anyOf` 组合分支）：调用值的
+   `child` 等属性触达**自引用 / 相互引用节点**时，会沿值重展开被引模式——
+   递归部分的已知约束失败则判失败，否则该值能否通过无法定论，记为
+   **无法判定**并给出模式位置（跨文件时含文件名，如
+   `models/pet.yaml#/Pet`），不增加已覆盖格；**未触达的可选循环属性仍可
+   覆盖**；能否通过仍依赖 `pattern`、`not`、`contains` 等**未支持关键字**时，
+   同样记为**无法判定**并列出关键字及其位置，与取值类型无关的关键字（如
+   整数值上的 `pattern`）不会误报。
    组合分支按**三态**裁决——确定通过 / 确定失败 / 待定（已知约束全过但仍
    依赖未支持或不可判定约束）：
    - `oneOf` 要求**恰好一个**分支通过：一个分支确定通过、另一分支含
-     `pattern` 等未支持约束**仍可能通过**时，是否“恰好一个”无法定论 →
-     该行记为**无法判定**（列出待定关键字及位置，不计覆盖格）；
+     `pattern` 等未支持约束或触达循环**仍可能通过**时，是否“恰好一个”无法
+     定论 → 该行记为**无法判定**（列出待定关键字及位置，不计覆盖格）；
      **两个分支都确定通过 → 校验失败**。
    - `anyOf` 要求**至少一个**分支通过：相同条件下只要一个分支确定通过
      即可覆盖；没有确定通过、仅剩待定分支时才记**无法判定**。
@@ -193,8 +205,8 @@ curl -s -X POST "http://localhost:8000/api/analyses/$AID/coverage/baseline" \
     "operations_total": 5, "operations_applicable": 5,
     "operations_without_cells": 0,
     "cells_total": 7, "cells_covered": 6, "cells_gap": 1,
-    "calls_total": 10, "calls_covered": 6,
-    "calls_validation_failed": 2, "calls_undetermined": 0,
+    "calls_total": 12, "calls_covered": 6,
+    "calls_validation_failed": 3, "calls_undetermined": 1,
     "calls_unmatched": 1, "calls_ambiguous": 0,
     "calls_excluded_media": 1, "calls_invalid": 0
   },
@@ -217,6 +229,16 @@ curl -s -X POST "http://localhost:8000/api/analyses/$AID/coverage/baseline" \
      "status": "200", "operation": "GET /pets",
      "matched_template": "/pets", "cell": "200|application/json",
      "resolved_status": "200", "reasons": []},
+    {"line": 11, "outcome": "undetermined", "method": "GET",
+     "path": "/pets/8", "status": "200", "operation": "GET /pets/{petId}",
+     "matched_template": "/pets/{petId}", "cell": null,
+     "reasons": ["响应 200 application/json 载荷能否通过无法判定: "
+                 "循环引用（models/pet.yaml#/Pet）"]},
+    {"line": 12, "outcome": "validation_failed", "method": "GET",
+     "path": "/pets/9", "status": "200", "operation": "GET /pets/{petId}",
+     "matched_template": "/pets/{petId}", "cell": null,
+     "reasons": ["响应 200 application/json 载荷不满足 schema: "
+                 "/parent/id: 类型 string 不被允许 ['integer']"]},
     {"line": 7, "outcome": "validation_failed", "method": "GET",
      "path": "/pets", "status": "200", "operation": "GET /pets",
      "matched_template": "/pets", "cell": null,
@@ -336,7 +358,7 @@ app/
     pointer.py           # JSON Pointer (RFC 6901) 工具
     resolver.py          # 本地/跨文件 $ref 解析（外部引用拒绝抓取）
     schemagraph.py       # 规范化 Schema 图：$ref、allOf 合并、循环终止
-    instance.py          # 最小实例生成 + 模式校验（反例重放基础）+ 沿实际取值检测未支持关键字
+    instance.py          # 最小实例生成 + 模式校验（反例重放基础）+ 沿实际取值的三态裁决（含循环/不可解析节点）
     endpointrequest.py   # 端点级最小 JSON 请求构造与基线请求约束核对
     structuralreplay.py  # 结构性 finding（参数/请求体/状态码/媒体类型增删）的结构化反例与语义重放
     comparator.py        # 兼容性比较引擎与最小反例综合
@@ -348,7 +370,7 @@ app/
   db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖）
   static/                # 原生 JS 前端（无框架、无构建步骤）
 examples/                # 基线 / 候选示例文档包 + calls-baseline.ndjson 调用记录
-tests/                   # pytest（引擎/循环 27 项 + API 25 项 + 调用覆盖 31 项）
+tests/                   # pytest（引擎/循环 27 项 + API 25 项 + 调用覆盖 39 项）
 ```
 
 ## 说明与边界

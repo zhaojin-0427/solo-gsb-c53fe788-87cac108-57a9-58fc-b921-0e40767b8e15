@@ -8,3 +8,5 @@
 {"method":"GET","path":"/unknown/path","request":{},"response":{"status":200}}
 {"method":"GET","path":"/pets","request":{},"response":{"status":200,"media_type":"text/csv","body":"id,name\n1,Rex"}}
 {"method":"GET","path":"/pets","request":{},"response":{"status":599}}
+{"method":"GET","path":"/pets/8","request":{},"response":{"status":200,"media_type":"application/json","body":{"id":8,"name":"Pluto","status":"available","parent":{"id":3,"name":"Coco","status":"sold"}}}}
+{"method":"GET","path":"/pets/9","request":{},"response":{"status":200,"media_type":"application/json","body":{"id":9,"name":"Fido","status":"available","parent":{"id":"bad-id","name":"Coco","status":"sold"}}}}

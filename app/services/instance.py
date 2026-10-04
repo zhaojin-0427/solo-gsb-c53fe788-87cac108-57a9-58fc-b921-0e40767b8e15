@@ -5,6 +5,13 @@ The generator produces the *smallest* value satisfying a normalized node
 a depth budget so recursive schemas terminate. The validator is the same
 constraint set the comparator reasons about; it is used to verify that a
 generated counter-example passes exactly one side.
+
+Call coverage does not use the replay validator directly: :func:`assess`
+walks *along the actual value* and returns a three-state verdict
+(pass / fail / pending) so a value whose ``child`` reaches a self- or
+mutually-referential node is never optimistically counted as covered —
+known constraints failing inside the recursive part still fail, otherwise
+the row is undetermined with the schema location reported.
 """
 from __future__ import annotations
 
@@ -56,119 +63,382 @@ def type_allows(node: SchemaNode, value_type: str, value: Any = None) -> bool:
 
 def validate(node: SchemaNode, value: Any, path: str = "",
              depth: int = 0) -> list[str]:
-    """Return a list of validation error messages (empty => valid)."""
+    """Return a list of validation error messages (empty => valid).
+
+    Replay semantics: ``is_cycle`` nodes are *transparent* (optimistically
+    accepted), ``invalid`` nodes yield one error, and ``oneOf``/``anyOf``
+    branches whose verdict is undecidable (cycles / invalid / unsupported
+    keywords reached by the value) neither pass nor fail — used by witness
+    self-check / replay, not by call coverage (which uses the three-state
+    :func:`assess` instead).
+    """
+    return _assess(node, value, path=path, depth=depth,
+                   mode="replay").errors
+
+
+# ============================================================ three-state
+# 沿实际取值对 schema 图的三态裁决（调用覆盖专用）：
+#   PASS     确定通过：取值触达的所有已知约束通过，且无循环/不可解析/
+#            未支持的未决因素；
+#   FAIL     确定失败：取值触达的已知（可判定）约束已经失败——未支持或
+#            不可判定的约束只会更严格，不可能挽回该失败；
+#   PENDING  待定：已知约束全过，但取值沿图触达了循环引用、无法解析的
+#            模式或 pattern 等未支持关键字，能否通过无法定论。
+TRI_PASS = "pass"
+TRI_FAIL = "fail"
+TRI_PENDING = "pending"
+
+
+class Assessment:
+    __slots__ = ("state", "errors", "hits")
+
+    def __init__(self, state: str, errors=None, hits=None):
+        self.state = state
+        self.errors: list[str] = errors or []
+        self.hits: list = hits or []
+
+
+def _pass(result: Assessment) -> Assessment:
+    result.state = TRI_PASS
+    return result
+
+
+def assess(node: SchemaNode, value: Any, *, reenter=None) -> Assessment:
+    """Three-state verdict of ``value`` against the parsed schema graph.
+
+    Walks *along the actual value* — resolved local ``$ref`` chains, nested
+    properties, array items and ``oneOf``/``anyOf`` branches. Reference cycles
+    reached by the value are not optimistically accepted: when the value
+    re-enters a self-/mutually-referential node, the schema at that site is
+    re-expanded (via ``reenter``) and checked again against the remaining
+    value nesting, so that known constraints failing inside the recursive
+    part make the verdict FAIL, while genuinely undecidable recursion (or an
+    unresolvable/invalid node reached by the value) makes it PENDING with
+    the schema location reported. Optional properties absent from the value
+    are never visited.
+
+    ``reenter(file, pointer) -> SchemaNode`` rebuilds the full node at a
+    cycle-marker site; when omitted the cycle is reported as PENDING without
+    re-expansion.
+    """
+    return _assess(node, value, path="", depth=0,
+                   mode="coverage", reenter=reenter, visited=frozenset(),
+                   reentries=0)
+
+
+def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
+            mode: str, reenter=None, visited: frozenset = frozenset(),
+            reentries: int = 0, _skip_self: bool = False) -> Assessment:
+    """Recursive verdict core.
+
+    ``depth`` bounds nesting for the legacy ``replay`` mode (which
+    optimistically truncates). In ``coverage`` mode ordinary property /
+    array nesting is walked fully — a non-recursive schema is finite — and
+    only recursive **re-entries** are bounded by ``reentries``
+    (:data:`MAX_DEPTH`): once exceeded the value stays 待定 (it is never
+    optimistically accepted). ``visited`` is the set of definition sites
+    active on the current value path / combinator branch (revisiting one
+    means the value reached a recursive node); ``_skip_self`` marks a node
+    just re-expanded by :func:`_revisit`; ``mode`` is ``"coverage"``
+    (three-state) or ``"replay"`` (legacy witness/replay semantics)."""
     errors: list[str] = []
-    if node.is_bool is True:
-        return errors
+    hits: list = []
+
+    def fail(msg: str) -> Assessment:
+        return Assessment(TRI_FAIL, errors + [msg], hits)
+
+    if node is None or node.is_bool is True:
+        return _pass(Assessment(TRI_PASS))
     if node.is_bool is False:
-        return [f"{path or '#'}: false 模式不允许任何值"]
+        return fail(f"{path or '#'}: false 模式不允许任何值")
     if node.is_cycle:
-        return errors  # cannot judge => optimistically accept
+        if mode == "replay":
+            # 旧的重放语义：循环标记透明（乐观接受），不展开。
+            return Assessment(TRI_PASS)
+        return _revisit(node.loc, value, path, reenter, visited,
+                        reentries)
     if node.invalid:
-        return [f"{path or '#'}: 模式不可判定（{node.invalid}）"]
-    if node.unsupported:
-        # We can still check the facets we know; unsupported keywords are
-        # treated as transparent for replay purposes, and reported separately.
-        pass
+        if mode == "replay":
+            return fail(f"{path or '#'}: 模式不可判定（{node.invalid}）")
+        return Assessment(TRI_PENDING, [],
+                          [("模式不可判定", node.loc)])
+
+    site_key = (node.loc.file, node.loc.pointer)
+    if mode == "coverage" and not _skip_self and site_key in visited:
+        # 取值沿图重新触达了一个已在当前路径上展开的定义 → 递归节点
+        return _revisit(node.loc, value, path, reenter, visited,
+                        reentries)
+    if mode == "coverage":
+        child_visited = visited if _skip_self else visited | {site_key}
+    else:
+        child_visited = visited
 
     vt = _json_type(value)
+    type_failed = False
     if not type_allows(node, vt, value):
-        errors.append(f"{path or '#'}: 类型 {vt} 不被允许 {sorted(node.type or [])}")
-        return errors  # further facet checks would be noise
+        errors.append(
+            f"{path or '#'}: 类型 {vt} 不被允许 {sorted(node.type or [])}")
+        type_failed = True
 
-    if value is None:
-        return errors
+    # 与取值类型相关的未支持关键字（coverage 三态下报告位置）
+    if mode == "coverage" and not type_failed:
+        for kw, loc in node.unsupported:
+            applies = _UNSUPPORTED_KW_TYPES.get(kw)
+            if applies is None or vt in applies:
+                hits.append((kw, loc))
 
-    if node.enum is not None:
-        if not any(_json_safe_equal(value, e) for e in node.enum):
+    child_state = TRI_PASS
+
+    def absorb(result: Assessment) -> None:
+        """Fold a child verdict in: FAIL dominates; otherwise PENDING sticks;
+        hits/errors are collected for location reporting."""
+        nonlocal child_state
+        for h in result.hits:
+            if h not in hits:
+                hits.append(h)
+        if result.errors:
+            errors.extend(result.errors)
+        if result.state == TRI_FAIL:
+            child_state = TRI_FAIL
+        elif result.state == TRI_PENDING and child_state != TRI_FAIL:
+            child_state = TRI_PENDING
+
+    if not type_failed and value is not None:
+        if node.enum is not None and not any(
+                _json_safe_equal(value, e) for e in node.enum):
             errors.append(f"{path or '#'}: 值不在枚举 {node.enum} 中")
-    if node.const is not UNSET and node.const is not None:
-        if not _json_safe_equal(value, node.const):
-            errors.append(f"{path or '#'}: 值必须等于常量 {node.const!r}")
+        if node.const is not UNSET and node.const is not None and \
+                not _json_safe_equal(value, node.const):
+            errors.append(
+                f"{path or '#'}: 值必须等于常量 {node.const!r}")
 
-    if vt in ("integer", "number"):
-        if node.minimum is not None and value < node.minimum:
-            errors.append(f"{path or '#'}: {value} 小于 minimum {node.minimum}")
-        if node.maximum is not None and value > node.maximum:
-            errors.append(f"{path or '#'}: {value} 大于 maximum {node.maximum}")
-        if node.ex_min is not None and value <= node.ex_min:
-            errors.append(
-                f"{path or '#'}: {value} 必须大于 exclusiveMinimum {node.ex_min}")
-        if node.ex_max is not None and value >= node.ex_max:
-            errors.append(
-                f"{path or '#'}: {value} 必须小于 exclusiveMaximum {node.ex_max}")
-        if node.multiple_of is not None and not _is_multiple(value,
-                                                             node.multiple_of):
-            errors.append(
-                f"{path or '#'}: {value} 不是 {node.multiple_of} 的倍数")
+        if vt in ("integer", "number"):
+            if node.minimum is not None and value < node.minimum:
+                errors.append(
+                    f"{path or '#'}: {value} 小于 minimum {node.minimum}")
+            if node.maximum is not None and value > node.maximum:
+                errors.append(
+                    f"{path or '#'}: {value} 大于 maximum {node.maximum}")
+            if node.ex_min is not None and value <= node.ex_min:
+                errors.append(
+                    f"{path or '#'}: {value} 必须大于 exclusiveMinimum "
+                    f"{node.ex_min}")
+            if node.ex_max is not None and value >= node.ex_max:
+                errors.append(
+                    f"{path or '#'}: {value} 必须小于 exclusiveMaximum "
+                    f"{node.ex_max}")
+            if node.multiple_of is not None and \
+                    not _is_multiple(value, node.multiple_of):
+                errors.append(
+                    f"{path or '#'}: {value} 不是 {node.multiple_of} 的倍数")
 
-    if vt == "string":
-        if node.min_length is not None and len(value) < node.min_length:
-            errors.append(
-                f"{path or '#'}: 字符串长度小于 minLength {node.min_length}")
-        if node.max_length is not None and len(value) > node.max_length:
-            errors.append(
-                f"{path or '#'}: 字符串长度超过 maxLength {node.max_length}")
+        if vt == "string":
+            if node.min_length is not None and len(value) < node.min_length:
+                errors.append(
+                    f"{path or '#'}: 字符串长度小于 minLength "
+                    f"{node.min_length}")
+            if node.max_length is not None and len(value) > node.max_length:
+                errors.append(
+                    f"{path or '#'}: 字符串长度超过 maxLength "
+                    f"{node.max_length}")
 
-    if vt == "array" and node.items is not None and depth < MAX_DEPTH:
-        if node.min_items is not None and len(value) < node.min_items:
-            errors.append(
-                f"{path or '#'}: 数组元素少于 minItems {node.min_items}")
-        if node.max_items is not None and len(value) > node.max_items:
-            errors.append(
-                f"{path or '#'}: 数组元素超过 maxItems {node.max_items}")
-        if node.unique_items:
-            seen = [_json_key(v) for v in value]
-            if len(set(seen)) != len(seen):
-                errors.append(f"{path or '#'}: 数组元素不唯一")
-        for i, item in enumerate(value):
-            errors.extend(validate(node.items, item,
-                                   f"{path}/{i}", depth + 1))
+        if vt == "array":
+            if node.min_items is not None and len(value) < node.min_items:
+                errors.append(
+                    f"{path or '#'}: 数组元素少于 minItems "
+                    f"{node.min_items}")
+            if node.max_items is not None and len(value) > node.max_items:
+                errors.append(
+                    f"{path or '#'}: 数组元素超过 maxItems "
+                    f"{node.max_items}")
+            if node.unique_items:
+                seen = [_json_key(v) for v in value]
+                if len(set(seen)) != len(seen):
+                    errors.append(f"{path or '#'}: 数组元素不唯一")
+            if node.items is not None:
+                for i, item in enumerate(value):
+                    if mode == "replay":
+                        if depth + 1 >= MAX_DEPTH:
+                            break
+                    absorb(_assess(node.items, item,
+                                   path=f"{path}/{i}", depth=depth + 1,
+                                   mode=mode, reenter=reenter,
+                                   visited=child_visited,
+                                   reentries=reentries))
 
-    if vt == "object":
-        if node.min_props is not None and len(value) < node.min_props:
-            errors.append(
-                f"{path or '#'}: 属性数少于 minProperties {node.min_props}")
-        if node.max_props is not None and len(value) > node.max_props:
-            errors.append(
-                f"{path or '#'}: 属性数超过 maxProperties {node.max_props}")
-        for req in node.required:
-            if req not in value:
-                errors.append(f"{path or '#'}: 缺少必填属性 {req!r}")
-        for pname, pnode in node.properties.items():
-            if pname in value and depth < MAX_DEPTH:
-                # request/response filtering at replay time is done by the
-                # caller; raw nodes keep both readOnly/writeOnly facets
-                errors.extend(validate(pnode, value[pname],
-                                       f"{path}/{_esc(pname)}", depth + 1))
-        extra = {k: v for k, v in value.items() if k not in node.properties}
-        if node.additional is False and extra:
-            errors.append(
-                f"{path or '#'}: 不允许额外属性 {sorted(extra)}")
-        elif isinstance(node.additional, SchemaNode) and depth < MAX_DEPTH:
-            for k, v in sorted(extra.items()):
-                errors.extend(validate(node.additional, v,
-                                       f"{path}/{_esc(k)}", depth + 1))
+        if vt == "object":
+            if node.min_props is not None and len(value) < node.min_props:
+                errors.append(
+                    f"{path or '#'}: 属性数少于 minProperties "
+                    f"{node.min_props}")
+            if node.max_props is not None and len(value) > node.max_props:
+                errors.append(
+                    f"{path or '#'}: 属性数超过 maxProperties "
+                    f"{node.max_props}")
+            for req in node.required:
+                if req not in value:
+                    errors.append(
+                        f"{path or '#'}: 缺少必填属性 {req!r}")
+            for pname, pnode in node.properties.items():
+                if pname not in value:
+                    continue
+                if mode == "replay" and depth + 1 >= MAX_DEPTH:
+                    continue
+                absorb(_assess(pnode, value[pname],
+                               path=f"{path}/{_esc(pname)}",
+                               depth=depth + 1,
+                               mode=mode, reenter=reenter,
+                               visited=child_visited,
+                               reentries=reentries))
+            extra = [k for k in value if k not in node.properties]
+            if node.additional is False and extra:
+                errors.append(
+                    f"{path or '#'}: 不允许额外属性 {sorted(extra)}")
+            elif isinstance(node.additional, SchemaNode):
+                for k in sorted(extra):
+                    if mode == "replay" and depth + 1 >= MAX_DEPTH:
+                        continue
+                    absorb(_assess(node.additional, value[k],
+                                   path=f"{path}/{_esc(k)}",
+                                   depth=depth + 1,
+                                   mode=mode, reenter=reenter,
+                                   visited=child_visited,
+                                   reentries=reentries))
 
-    # 组合分支按三态裁决（确定通过 / 确定失败 / 待定）：oneOf 要求
-    # **恰好一个**分支确定通过——两个确定通过即校验失败；anyOf 要求
-    # **至少一个**。存在待定分支时此处不下定论（校验既未确定失败），
-    # 由 unsupported_along_value 沿值上报待定关键字与位置。
-    if node.one_of and depth < MAX_DEPTH:
-        verdicts = _branch_verdicts(node.one_of, value, path, depth)
-        n_pass = verdicts.count(_BRANCH_PASS)
+    # ---- 组合分支：replay 模式按旧语义（循环/不可判定/未支持分支为
+    # 「未定」，既不计通过也不计失败）枚举组合错误；coverage 模式走
+    # _combine 的三态裁决。
+    if mode == "replay":
+        if node.one_of and depth < MAX_DEPTH:
+            states = [_replay_branch_state(b, value, depth)
+                      for b in node.one_of]
+            n_pass = states.count("pass")
+            if n_pass >= 2:
+                errors.append(
+                    f"{path or '#'}: 同时满足 oneOf 的 {n_pass} 个分支"
+                    "（要求恰好一个）")
+            elif n_pass == 0 and "undecided" not in states:
+                errors.append(f"{path or '#'}: 不满足 oneOf 的任何分支")
+        if node.any_of and depth < MAX_DEPTH:
+            states = [_replay_branch_state(b, value, depth)
+                      for b in node.any_of]
+            if "pass" not in states and "undecided" not in states:
+                errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
+        return Assessment(TRI_FAIL if errors else TRI_PASS, errors, hits)
+
+    # coverage 三态
+    facet_failed = bool(errors) or child_state == TRI_FAIL
+    if facet_failed:
+        return Assessment(TRI_FAIL, errors, hits)
+
+    if node.one_of:
+        return _combine(node.one_of, value, path,
+                        reenter, visited, reentries, exactly_one=True)
+    if node.any_of:
+        return _combine(node.any_of, value, path,
+                        reenter, visited, reentries, exactly_one=False)
+
+    if errors:
+        return Assessment(TRI_FAIL, errors, hits)
+    if child_state == TRI_PENDING or hits:
+        return Assessment(TRI_PENDING, errors, hits)
+    return Assessment(TRI_PASS, errors, hits)
+
+
+def _revisit(loc, value, path, reenter, visited, reentries):
+    """The value re-entered a recursive schema definition (``loc``).
+
+    Reaching such a node is inherently **待定** — a finite value proves
+    nothing about a recursive schema. The definition is nevertheless
+    re-expanded against the same (remaining) value so that **known
+    constraints failing inside the recursive part take priority** and make
+    the verdict FAIL; only when no known constraint fails is the verdict
+    PENDING, reporting the cycle's schema location. Re-expansion is bounded
+    by ``reentries`` (:data:`MAX_DEPTH`) so mutually recursive graphs
+    terminate: once exhausted, the row stays 待定 rather than being
+    optimistically accepted.
+    """
+    cycle_hit = ("循环引用", loc)
+    if reentries >= MAX_DEPTH or reenter is None:
+        return Assessment(TRI_PENDING, [], [cycle_hit])
+    target = reenter(loc.file, loc.pointer)
+    if target is None:
+        return Assessment(TRI_PENDING, [], [cycle_hit])
+    if target.is_cycle or target.invalid:
+        return Assessment(TRI_PENDING, [],
+                          [cycle_hit] + ([("模式不可判定", target.loc)]
+                                         if target.invalid else []))
+    result = _assess(target, value, path=path, depth=0,
+                     mode="coverage", reenter=reenter, visited=visited,
+                     reentries=reentries + 1, _skip_self=True)
+    hits = [cycle_hit] + [h for h in result.hits if h != cycle_hit]
+    # 同一分支的已知失败优先；否则触达循环即为待定（带模式位置）
+    if result.state == TRI_FAIL:
+        return Assessment(TRI_FAIL, result.errors, hits)
+    return Assessment(TRI_PENDING, result.errors, hits)
+
+
+def _replay_branch_state(node: SchemaNode, value: Any, depth: int) -> str:
+    """Old replay branch classification: undecidable nodes / unsupported
+    keywords reached by the value make the branch ``undecided``; otherwise
+    known-constraint errors => ``fail``, clean => ``pass``."""
+    r = _assess(node, value, path="", depth=depth + 1,
+                mode="coverage", reenter=None, visited=frozenset(),
+                reentries=0)
+    if r.hits:
+        return "undecided"
+    return "fail" if r.errors else "pass"
+
+
+def _combine(branches, value, path, reenter, visited, reentries,
+             *, exactly_one: bool) -> Assessment:
+    """oneOf（exactly_one=True，恰好一个分支通过）/ anyOf（至少一个）。
+
+    分支状态三态：确定通过 / 确定失败 / 待定。已知约束失败的分支不会
+    因为触达循环/未支持约束而翻案——失败优先。
+    """
+    states: list[str] = []
+    errors: list[str] = []
+    hits: list = []
+    for b in branches:
+        r = _assess(b, value, path=path, depth=0,
+                    mode="coverage", reenter=reenter, visited=visited,
+                    reentries=reentries)
+        states.append(r.state)
+        for h in r.hits:
+            if h not in hits:
+                hits.append(h)
+        errors.extend(r.errors)
+    n_pass = states.count(TRI_PASS)
+    n_pending = states.count(TRI_PENDING)
+
+    if exactly_one:
+        # 两个确定通过 → 确定失败（违反「恰好一个」）
         if n_pass >= 2:
-            errors.append(
-                f"{path or '#'}: 同时满足 oneOf 的 {n_pass} 个分支"
-                "（要求恰好一个）")
-        elif n_pass == 0 and _BRANCH_UNDECIDED not in verdicts:
-            errors.append(f"{path or '#'}: 不满足 oneOf 的任何分支")
-    if node.any_of and depth < MAX_DEPTH:
-        verdicts = _branch_verdicts(node.any_of, value, path, depth)
-        if _BRANCH_PASS not in verdicts and \
-                _BRANCH_UNDECIDED not in verdicts:
-            errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
-    return errors
+            return Assessment(TRI_FAIL,
+                              [f"{path or '#'}: 同时满足 oneOf 的 {n_pass} "
+                               "个分支（要求恰好一个）"] + errors, hits)
+        # 一个确定通过 + 其余分支仍可能通过（待定）→ 是否恰好一个无定论
+        if n_pass == 1 and n_pending > 0:
+            return Assessment(TRI_PENDING, [], hits)
+        # 一个确定通过且其余确定失败 → 通过
+        if n_pass == 1:
+            return Assessment(TRI_PASS, [], hits)
+        # 没有确定通过：所有分支确定失败 → 失败；否则待定
+        if n_pending == 0:
+            return Assessment(TRI_FAIL,
+                              [f"{path or '#'}: 不满足 oneOf 的任何分支"]
+                              + errors, hits)
+        return Assessment(TRI_PENDING, [], hits)
+
+    # anyOf：至少一个确定通过即可；否则有待定即待定；全失败才失败
+    if n_pass >= 1:
+        return Assessment(TRI_PASS, [], hits)
+    if n_pending > 0:
+        return Assessment(TRI_PENDING, [], hits)
+    return Assessment(TRI_FAIL,
+                      [f"{path or '#'}: 不满足 anyOf 的任何分支"]
+                      + errors, hits)
 
 
 # Unsupported keyword -> JSON types it constrains. Keywords missing from this
@@ -189,144 +459,14 @@ _UNSUPPORTED_KW_TYPES = {
 }
 
 
-def unsupported_along_value(node: SchemaNode, value: Any,
-                            depth: int = 0) -> list:
-    """Unsupported keywords whose skipped constraints decide ``value``'s fate.
+def unsupported_along_value(node: SchemaNode, value: Any) -> list:
+    """Compatibility wrapper: ``(keyword, FacetLoc)`` hits for a value.
 
-    Walks the parsed schema graph *along the actual value* — local ``$ref``
-    (already resolved into the graph), nested properties, array items and
-    ``oneOf``/``anyOf`` branches — and returns ``(keyword, FacetLoc)`` for
-    every unsupported keyword the value's verdict still depends on. Optional
-    properties absent from the value are not visited, and keywords that do
-    not apply to the value's JSON type (e.g. ``pattern`` for an integer) are
-    ignored. Compositions are adjudicated per branch state
-    （确定通过 / 确定失败 / 待定）: for ``oneOf`` a single cleanly passing
-    branch only settles the verdict when every other branch definitely
-    fails — a sibling that may still pass (``pattern`` …) keeps the row
-    undetermined; for ``anyOf`` one cleanly passing branch is enough.
+    Kept for callers outside the coverage engine; coverage itself uses
+    :func:`assess` (which also classifies cycles / invalid nodes and
+    adjudicates ``oneOf``/``anyOf`` into the three-state verdict).
     """
-    hits: list = []
-    if node is None or depth >= MAX_DEPTH:
-        return hits
-    if node.is_bool is not None or node.is_cycle or node.invalid:
-        return hits  # bool/cycle/invalid nodes are reported by the caller
-
-    vt = _json_type(value)
-    for kw, loc in node.unsupported:
-        applies = _UNSUPPORTED_KW_TYPES.get(kw)
-        if applies is None or vt in applies:
-            hits.append((kw, loc))
-
-    if vt == "object":
-        for pname, pnode in node.properties.items():
-            if pname in value:
-                hits.extend(unsupported_along_value(
-                    pnode, value[pname], depth + 1))
-        if isinstance(node.additional, SchemaNode):
-            extra = [k for k in value if k not in node.properties]
-            for k in sorted(extra):
-                hits.extend(unsupported_along_value(
-                    node.additional, value[k], depth + 1))
-    elif vt == "array" and node.items is not None:
-        for item in value:
-            hits.extend(unsupported_along_value(node.items, item, depth + 1))
-
-    # oneOf「恰好一个」：一个分支确定通过时，任何仍可能通过的待定分支
-    # 都让整体无法判定（它若也通过就违反恰好一个）；没有确定通过时，
-    # 整体能否通过同样取决于待定分支。两个确定通过属于校验失败，
-    # 由 validate 报告，这里不再重复列举。
-    if node.one_of and depth < MAX_DEPTH:
-        verdicts = _branch_verdicts(node.one_of, value, "", depth)
-        if verdicts.count(_BRANCH_PASS) <= 1:
-            for branch, verdict in zip(node.one_of, verdicts):
-                if verdict == _BRANCH_UNDECIDED:
-                    hits.extend(_pending_hits(branch, value, depth + 1))
-    # anyOf「至少一个」：已有一个确定通过即覆盖（其余分支待定不影响
-    # 结论）；否则整体能否通过取决于待定分支。
-    if node.any_of and depth < MAX_DEPTH:
-        verdicts = _branch_verdicts(node.any_of, value, "", depth)
-        if _BRANCH_PASS not in verdicts:
-            for branch, verdict in zip(node.any_of, verdicts):
-                if verdict == _BRANCH_UNDECIDED:
-                    hits.extend(_pending_hits(branch, value, depth + 1))
-    return hits
-
-
-# ============================================================ branch verdicts
-# 组合分支（oneOf / anyOf）相对某个实际取值的三态裁决。
-_BRANCH_PASS = "pass"              # 确定通过：已知约束全过且无待定因素
-_BRANCH_FAIL = "fail"              # 确定失败：已支持约束已经失败
-_BRANCH_UNDECIDED = "undecided"    # 待定：通过与否仍依赖未支持/不可判定约束
-
-
-def _branch_verdicts(branches, value, path: str, depth: int) -> list:
-    """Classify each combinator branch for ``value`` into the three states.
-
-    * 确定失败：已支持（可判定）约束已经失败——未支持或不可判定的约束
-      只会更严格，不可能让分支重新通过；
-    * 待定：已知约束全过，但通过与否仍依赖 ``pattern`` 等未支持关键字，
-      或取值触达了循环引用 / 无法解析的节点；
-    * 确定通过：已知约束全过且没有任何待定因素。
-    """
-    verdicts: list = []
-    for b in branches:
-        if _undecidable_along_value(b, value, depth + 1):
-            verdicts.append(_BRANCH_UNDECIDED)
-        elif validate(b, value, path, depth + 1):
-            verdicts.append(_BRANCH_FAIL)
-        elif unsupported_along_value(b, value, depth + 1):
-            verdicts.append(_BRANCH_UNDECIDED)
-        else:
-            verdicts.append(_BRANCH_PASS)
-    return verdicts
-
-
-def _pending_hits(node: SchemaNode, value: Any, depth: int) -> list:
-    """待定分支需要列出的原因：未支持关键字，以及循环/不可判定节点位置。"""
-    hits = unsupported_along_value(node, value, depth)
-    hits.extend(_undecidable_along_value(node, value, depth))
-    return hits
-
-
-def _undecidable_along_value(node: SchemaNode, value: Any,
-                             depth: int = 0) -> list:
-    """Nodes along ``value`` whose constraints cannot be decided at all.
-
-    :func:`unsupported_along_value` reports unsupported *keywords*; this
-    walk covers the harder undecidable cases — reference cycles and
-    invalid / unresolvable schemas — so that a combinator branch touching
-    them is treated as 待定 instead of being optimistically counted as
-    确定通过. Untouched optional properties are not visited.
-    """
-    hits: list = []
-    if node is None or depth >= MAX_DEPTH:
-        return hits
-    if node.is_cycle:
-        hits.append(("循环引用", node.loc))
-        return hits
-    if node.invalid:
-        hits.append(("模式不可判定", node.loc))
-        return hits
-    if node.is_bool is not None:
-        return hits
-    vt = _json_type(value)
-    if vt == "object":
-        for pname, pnode in node.properties.items():
-            if pname in value:
-                hits.extend(_undecidable_along_value(
-                    pnode, value[pname], depth + 1))
-        if isinstance(node.additional, SchemaNode):
-            for k in sorted(k for k in value if k not in node.properties):
-                hits.extend(_undecidable_along_value(
-                    node.additional, value[k], depth + 1))
-    elif vt == "array" and node.items is not None:
-        for item in value:
-            hits.extend(_undecidable_along_value(node.items, item,
-                                                 depth + 1))
-    for branches in (node.one_of, node.any_of):
-        for b in branches:
-            hits.extend(_undecidable_along_value(b, value, depth + 1))
-    return hits
+    return assess(node, value).hits
 
 
 def minimal_instance(node: SchemaNode, depth: int = 0,
